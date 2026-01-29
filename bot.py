@@ -1,3 +1,10 @@
+# bot.py — GhostMail ✉️
+# Minimal user commands: /new /inbox /delete
+# Force-join with clean inline gate (edits same message)
+# Persistent reply-keyboard menu that changes based on whether user has an inbox
+# Keeps DM clean: deletes user commands + deletes previous bot message before sending new
+# Admin-only: /stats, /broadcast (text or reply-to-copy)
+
 import os
 import json
 import asyncio
@@ -8,27 +15,43 @@ from typing import Dict, Optional, Set, Any, List
 from datetime import datetime, timezone
 
 import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.constants import ParseMode, ChatMemberStatus
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
 MAILTM_BASE = "https://api.mail.tm"
 
-STATE_FILE = "state.json"     # stores per-user active inbox
-USERS_FILE = "users.json"     # stores user registry for stats/broadcast
+STATE_FILE = "state.json"     # stores per-user inbox (active only)
+USERS_FILE = "users.json"     # stores user registry + last bot msg id for clean DM
 
-POLL_SECONDS = 12  # optional notifier polling interval (gentle)
+# Render env
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 # ✅ Admin (you only)
-ADMIN_ID = 8243001035
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "8243001035"))
 
 # ✅ Force-join channels (IDs for verification)
-CHANNEL1 = "-1003527524127"  # Shein Loot 🎉
-CHANNEL2 = "-1003886262740"  # RageByte ⚡
+CHANNEL1 = os.environ.get("CHANNEL1", "-1003527524127").strip()  # Shein Loot 🎉
+CHANNEL2 = os.environ.get("CHANNEL2", "-1003886262740").strip()  # RageByte ⚡
 
 # ✅ Join buttons (invite links)
-CHANNEL1_URL = "https://t.me/+GD6Z749osJhkOWE1"
-CHANNEL2_URL = "https://t.me/+lwO9-J-si8dkODFl"
+CHANNEL1_URL = os.environ.get("CHANNEL1_URL", "https://t.me/+GD6Z749osJhkOWE1").strip()
+CHANNEL2_URL = os.environ.get("CHANNEL2_URL", "https://t.me/+lwO9-J-si8dkODFl").strip()
+
+# Optional background notifications (newest only)
+ENABLE_NOTIFIER = os.environ.get("ENABLE_NOTIFIER", "1").strip() == "1"
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "15"))
 
 
 # ---------------- MarkdownV2 helpers ----------------
@@ -70,10 +93,10 @@ class Inbox:
             seen_message_ids=set(d.get("seen_message_ids", [])),
         )
 
-# user_id -> Inbox (single active inbox only)
+# user_id -> Inbox
 STATE: Dict[str, Inbox] = {}
 
-# user_id -> {name, username, verified, first_seen, last_seen}
+# user_id -> {name, username, verified, first_seen, last_seen, last_bot_msg_id}
 USERS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -106,16 +129,13 @@ def save_users() -> None:
 def get_inbox(user_id: int) -> Optional[Inbox]:
     return STATE.get(str(user_id))
 
-
 def upsert_user(update: Update, verified: Optional[bool] = None):
     u = update.effective_user
     if not u:
         return
 
     uid = str(u.id)
-    first = u.first_name or ""
-    last = u.last_name or ""
-    name = (first + " " + last).strip()
+    name = ((u.first_name or "") + " " + (u.last_name or "")).strip()
     username = u.username or ""
 
     info = USERS.get(uid, {})
@@ -132,10 +152,55 @@ def upsert_user(update: Update, verified: Optional[bool] = None):
     USERS[uid] = info
     save_users()
 
-
 def is_admin(update: Update) -> bool:
     u = update.effective_user
     return bool(u and u.id == ADMIN_ID)
+
+
+# ---------------- UI (persistent menu) ----------------
+def user_menu(has_inbox: bool) -> ReplyKeyboardMarkup:
+    if not has_inbox:
+        keyboard = [[KeyboardButton("/new")]]
+    else:
+        keyboard = [[KeyboardButton("/inbox"), KeyboardButton("/delete")]]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+async def delete_user_command(update: Update):
+    try:
+        if update.message:
+            await update.message.delete()
+    except Exception:
+        pass
+
+async def clean_last_bot_msg(chat_id: int, app: Application):
+    info = USERS.get(str(chat_id), {})
+    last_id = info.get("last_bot_msg_id")
+    if last_id:
+        try:
+            await app.bot.delete_message(chat_id=chat_id, message_id=int(last_id))
+        except Exception:
+            pass
+
+async def send_clean(
+    chat_id: int,
+    app: Application,
+    text: str,
+    *,
+    parse_mode=None,
+    reply_markup=None,
+    disable_preview=True
+):
+    await clean_last_bot_msg(chat_id, app)
+    msg = await app.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=disable_preview
+    )
+    USERS.setdefault(str(chat_id), {})
+    USERS[str(chat_id)]["last_bot_msg_id"] = msg.message_id
+    save_users()
 
 
 # ---------------- mail.tm helpers ----------------
@@ -214,7 +279,7 @@ async def get_message_source(session: aiohttp.ClientSession, inbox: Inbox, msg_i
     return data.get("data", "")
 
 
-# ---------------- Force join (clean edits) ----------------
+# ---------------- Force-join gate (clean edits) ----------------
 def gate_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -237,9 +302,8 @@ async def joined_both(app: Application, user_id: int) -> bool:
     return a and b
 
 async def show_gate(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool):
-    first = update.effective_user.first_name or ""
-    last = update.effective_user.last_name or ""
-    profile_name = (first + " " + last).strip() or "there"
+    u = update.effective_user
+    profile_name = (((u.first_name or "") + " " + (u.last_name or "")).strip() or "there")
 
     text = (
         f"Welcome {profile_name} 👋\n\n"
@@ -247,7 +311,10 @@ async def show_gate(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bo
     )
 
     if edit and update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=gate_keyboard())
+        try:
+            await update.callback_query.message.edit_text(text, reply_markup=gate_keyboard())
+        except Exception:
+            await update.callback_query.message.reply_text(text, reply_markup=gate_keyboard())
     else:
         await update.effective_message.reply_text(text, reply_markup=gate_keyboard())
 
@@ -262,7 +329,6 @@ async def require_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     ok = await joined_both(context.application, q.from_user.id)
     upsert_user(update, verified=ok)
 
@@ -274,35 +340,57 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    has_inbox = bool(get_inbox(q.from_user.id))
     await q.message.edit_text(
-        "✅ **Verified!**\n\n"
-        "Commands:\n"
-        "/new – get a temp email\n"
-        "/inbox – show latest email\n"
-        "/delete – delete your temp email",
+        "✅ **Verified!**\n\nUse the buttons below:",
         parse_mode=ParseMode.MARKDOWN
+    )
+    # Send (clean) a separate menu message so reply keyboard appears nicely
+    await send_clean(
+        chat_id=q.from_user.id,
+        app=context.application,
+        text="Choose an option:",
+        reply_markup=user_menu(has_inbox=has_inbox),
+        disable_preview=True
     )
 
 
 # ---------------- User commands (ONLY 3) ----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Just show gate / or show minimal help
     if not await require_join(update, context):
         return
-    await update.message.reply_text(
-        "✅ You’re verified.\n\n"
-        "Commands:\n"
-        "/new – get a temp email\n"
-        "/inbox – show latest email\n"
-        "/delete – delete your temp email"
+
+    has_inbox = bool(get_inbox(update.effective_user.id))
+    await send_clean(
+        chat_id=update.effective_user.id,
+        app=context.application,
+        text="Welcome to GhostMail ✉️\n\nUse the buttons below:",
+        reply_markup=user_menu(has_inbox=has_inbox)
     )
 
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_join(update, context):
         return
 
+    await delete_user_command(update)
     user_id = update.effective_user.id
-    await update.message.reply_text("Creating your temp email…")
+
+    # If already has inbox, just show menu (no /new button)
+    if get_inbox(user_id):
+        await send_clean(
+            chat_id=user_id,
+            app=context.application,
+            text="You already have a temp email.\n\nUse /inbox to check latest mail or /delete to remove it.",
+            reply_markup=user_menu(has_inbox=True),
+        )
+        return
+
+    await send_clean(
+        chat_id=user_id,
+        app=context.application,
+        text="Creating your temp email…",
+        reply_markup=user_menu(has_inbox=False),
+    )
 
     async with aiohttp.ClientSession() as session:
         inbox = await create_inbox(session)
@@ -310,36 +398,59 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE[str(user_id)] = inbox
     save_state()
 
-    await update.message.reply_text(
-        f"✅ Your temp email:\n{inbox.address}\n\n"
-        "Use /inbox to check latest mail."
+    await send_clean(
+        chat_id=user_id,
+        app=context.application,
+        text=f"✅ Your temp email:\n{inbox.address}\n\nUse /inbox to check latest mail.",
+        reply_markup=user_menu(has_inbox=True),
     )
 
 async def inbox_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_join(update, context):
         return
 
+    await delete_user_command(update)
     user_id = update.effective_user.id
     inbox = get_inbox(user_id)
+
     if not inbox:
-        await update.message.reply_text("No temp email yet. Use /new")
+        await send_clean(
+            chat_id=user_id,
+            app=context.application,
+            text="No temp email yet. Tap /new.",
+            reply_markup=user_menu(has_inbox=False),
+        )
         return
 
     async with aiohttp.ClientSession() as session:
         msgs = await list_messages(session, inbox)
         if not msgs:
-            await update.message.reply_text("Inbox is empty.")
+            await send_clean(
+                chat_id=user_id,
+                app=context.application,
+                text="Inbox is empty.",
+                reply_markup=user_menu(has_inbox=True),
+            )
             return
 
         newest = msgs[0]
         mid = newest.get("id")
         if not mid:
-            await update.message.reply_text("Could not read latest email.")
+            await send_clean(
+                chat_id=user_id,
+                app=context.application,
+                text="Could not read latest email.",
+                reply_markup=user_menu(has_inbox=True),
+            )
             return
 
-        # Only newest triggers once
         if mid in inbox.seen_message_ids:
-            await update.message.reply_text("No new email yet.")
+            await send_clean(
+                chat_id=user_id,
+                app=context.application,
+                text="No new email yet.",
+                reply_markup=user_menu(has_inbox=True),
+            )
         else:
             full = await get_message(session, inbox, mid)
 
@@ -362,15 +473,18 @@ async def inbox_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{to_blockquote(mdv2_escape(body))}"
             )
 
-            await update.message.reply_text(
-                text[:3800],
+            await send_clean(
+                chat_id=user_id,
+                app=context.application,
+                text=text[:3800],
                 parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True
+                reply_markup=user_menu(has_inbox=True),
+                disable_preview=True
             )
 
             inbox.seen_message_ids.add(mid)
 
-        # Auto-delete all emails (keeps inbox clean)
+        # ✅ Always delete all emails on server to keep mailbox clean
         for m in msgs:
             did = m.get("id")
             if not did:
@@ -386,27 +500,41 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_join(update, context):
         return
 
+    await delete_user_command(update)
     user_id = update.effective_user.id
+
     if str(user_id) not in STATE:
-        await update.message.reply_text("No temp email to delete.")
+        await send_clean(
+            chat_id=user_id,
+            app=context.application,
+            text="No temp email to delete.",
+            reply_markup=user_menu(has_inbox=False),
+        )
         return
 
     STATE.pop(str(user_id), None)
     save_state()
-    await update.message.reply_text("🗑️ Deleted your temp email. Use /new to create another.")
+
+    await send_clean(
+        chat_id=user_id,
+        app=context.application,
+        text="🗑️ Deleted your temp email. Tap /new to create another.",
+        reply_markup=user_menu(has_inbox=False),
+    )
 
 
-# ---------------- Admin-only commands ----------------
+# ---------------- Admin-only ----------------
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
+    await delete_user_command(update)
 
     total = len(USERS)
     verified = sum(1 for v in USERS.values() if v.get("verified"))
 
-    # Show up to 80 users (adjust if you want)
+    # show up to 100 users
     lines = []
-    for uid, info in list(USERS.items())[:80]:
+    for uid, info in list(USERS.items())[:100]:
         name = info.get("name") or ""
         username = info.get("username") or ""
         tag = f"@{username}" if username else "(no username)"
@@ -417,153 +545,45 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Stats*\n"
         f"Total users: *{total}*\n"
         f"Verified users: *{verified}*\n\n"
-        f"*Users (sample up to 80):*\n" + "\n".join(lines or ["(empty)"])
+        f"*Users (sample up to 100):*\n" + "\n".join(lines or ["(empty)"])
     )
-
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await send_clean(
+        chat_id=update.effective_user.id,
+        app=context.application,
+        text=msg,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=user_menu(has_inbox=bool(get_inbox(update.effective_user.id))),
+        disable_preview=True
+    )
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
+    await delete_user_command(update)
 
     text = " ".join(context.args).strip() if context.args else ""
-
     recipients = [int(uid) for uid, info in USERS.items() if info.get("verified")]
+
     if not recipients:
-        await update.message.reply_text("No verified users to broadcast to.")
-        return
-
-    if not text and not update.message.reply_to_message:
-        await update.message.reply_text(
-            "Usage:\n"
-            "/broadcast <message>\n"
-            "OR reply to a message and send /broadcast"
+        await send_clean(
+            chat_id=update.effective_user.id,
+            app=context.application,
+            text="No verified users to broadcast to.",
+            reply_markup=user_menu(has_inbox=bool(get_inbox(update.effective_user.id))),
         )
         return
 
-    await update.message.reply_text(f"📣 Broadcasting to {len(recipients)} verified users…")
-
-    sent = 0
-    failed = 0
-
-    for uid in recipients:
-        try:
-            if text:
-                await context.application.bot.send_message(
-                    chat_id=uid,
-                    text=text,
-                    disable_web_page_preview=True
-                )
-            else:
-                # copy keeps it clean (no “forwarded from” header)
-                await update.message.reply_to_message.copy(chat_id=uid)
-
-            sent += 1
-            await asyncio.sleep(0.05)  # reduce flood risk
-        except Exception:
-            failed += 1
-
-    await update.message.reply_text(f"✅ Done.\nSent: {sent}\nFailed: {failed}")
-
-
-# ---------------- Optional notifier (newest-only) ----------------
-async def check_newest_and_notify(user_id: int, app: Application):
-    inbox = get_inbox(user_id)
-    if not inbox:
+    if not text and not (update.message and update.message.reply_to_message):
+        await send_clean(
+            chat_id=update.effective_user.id,
+            app=context.application,
+            text="Usage:\n/broadcast <message>\nOR reply to a message and send /broadcast",
+            reply_markup=user_menu(has_inbox=bool(get_inbox(update.effective_user.id))),
+        )
         return
 
-    async with aiohttp.ClientSession() as session:
-        msgs = await list_messages(session, inbox)
-        if not msgs:
-            return
-
-        newest = msgs[0]
-        mid = newest.get("id")
-        if not mid or mid in inbox.seen_message_ids:
-            return
-
-        full = await get_message(session, inbox, mid)
-
-        subject = full.get("subject") or "(no subject)"
-        from_obj = full.get("from") or {}
-        from_addr = from_obj.get("address") or "unknown"
-        from_name = from_obj.get("name") or ""
-        from_line = f"{from_name} <{from_addr}>" if from_name else f"<{from_addr}>"
-
-        body = (full.get("text") or "").strip()
-        if not body:
-            body = (await get_message_source(session, inbox, mid)).strip() or "(no body)"
-
-        text = (
-            f"*From:* {mdv2_escape(from_line)}\n"
-            f"*{mdv2_escape(subject)}*\n"
-            f"{to_blockquote(mdv2_escape(body))}"
-        )
-
-        await app.bot.send_message(
-            chat_id=user_id,
-            text=text[:3800],
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True
-        )
-
-        inbox.seen_message_ids.add(mid)
-
-        # auto-delete all
-        for m in msgs:
-            did = m.get("id")
-            if did:
-                try:
-                    await safe_delete(session, inbox, f"/messages/{did}")
-                except Exception:
-                    pass
-
-    save_state()
-
-async def poll_loop(app: Application):
-    while True:
-        try:
-            for uid_str in list(STATE.keys()):
-                uid = int(uid_str)
-                # only notify verified users
-                info = USERS.get(uid_str, {})
-                if not info.get("verified"):
-                    continue
-                await check_newest_and_notify(uid, app)
-        except Exception:
-            pass
-        await asyncio.sleep(POLL_SECONDS)
-
-
-def main():
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        raise SystemExit("Set BOT_TOKEN env var")
-
-    load_state()
-    load_users()
-
-    app = Application.builder().token(token).build()
-
-    # User
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("new", new_cmd))
-    app.add_handler(CommandHandler("inbox", inbox_cmd))
-    app.add_handler(CommandHandler("delete", delete_cmd))
-
-    # Force join
-    app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_join$"))
-
-    # Admin-only
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-
-    async def on_start(app_: Application):
-        # If you want ONLY manual /inbox and NO auto notifications, comment next line.
-        app_.create_task(poll_loop(app_))
-
-    app.post_init = on_start
-    app.run_polling(close_loop=False)
-
-if __name__ == "__main__":
-    main()
+    await send_clean(
+        chat_id=update.effective_user.id,
+        app=context.application,
+        text=f"📣 Broadcasting to {len(recipients)} verified users…",
+        reply_markup=user_menu(has_inbox=bool(get_inbox(update.effecti
