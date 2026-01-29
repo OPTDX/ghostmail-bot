@@ -3,6 +3,7 @@ import json
 import asyncio
 import secrets
 import string
+from aiohttp import web
 from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Set, Any, List
 from datetime import datetime, timezone
@@ -202,6 +203,8 @@ async def send_clean(chat_id: int, app: Application, text: str, *, parse_mode=No
 
 
 # ---------------- mail.tm helpers ----------------
+async def health_check(request):
+    return web.Response(text="GhostMail Bot is running ✅")
 async def mailtm_get(session: aiohttp.ClientSession, path: str, token: Optional[str] = None, params: Optional[dict] = None):
     headers = {}
     if token:
@@ -718,12 +721,17 @@ def main():
 
     app.post_init = post_init
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="telegram",
-        webhook_url=f"{RENDER_EXTERNAL_URL}/telegram",
-        close_loop=False,
+    web_app = web.Application()
+web_app.router.add_get("/", health_check)
+
+app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    url_path="telegram",
+    webhook_url=f"{RENDER_EXTERNAL_URL}/telegram",
+    web_app=web_app,
+    close_loop=False,
+)
     )
 
 if __name__ == "__main__":
