@@ -161,7 +161,7 @@ def is_admin(update: Update) -> bool:
 def user_menu(has_inbox: bool) -> ReplyKeyboardMarkup:
     # Attractive buttons; these are TEXT messages, routed by menu_text_router.
     if not has_inbox:
-        keyboard = [[KeyboardButton("Add New ⭐")]]
+        keyboard = [[KeyboardButton("New Email⭐")]]
     else:
         keyboard = [
             [KeyboardButton("Inbox 📥"), KeyboardButton("Delete 🚫")],
