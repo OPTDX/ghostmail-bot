@@ -1,0 +1,2 @@
+# ghostmail-bot
+Temp Email 
